@@ -734,6 +734,53 @@ ngx_http_ssl_handshake(ngx_event_t *rev)
     }
 
     if (hc->proxy_protocol) {
+
+        /*
+         * PPv2 completeness pre-check: if the peeked data starts with the
+         * PPv2 signature and the 16-byte fixed header is present, compute
+         * the full declared length (16 + payload) and wait for more data
+         * if the kernel buffer does not yet contain it all.  This avoids
+         * closing legitimate connections whose PPv2 header spans multiple
+         * TCP segments, mirroring the equivalent fix in the stream module.
+         */
+        static const u_char  ngx_ppv2_sig[] =
+            "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
+
+        if ((size_t) n >= 16
+            && ngx_memcmp(buf, ngx_ppv2_sig, 12) == 0)
+        {
+            size_t  need = 16 + (size_t) ((buf[14] << 8) | buf[15]);
+
+            if (need > NGX_PROXY_PROTOCOL_MAX_HEADER) {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "PROXY protocol v2 header is too large: %uz",
+                              need);
+                ngx_http_close_connection(c);
+                return;
+            }
+
+            if ((size_t) n < need) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                               "PROXY protocol v2 header incomplete: "
+                               "%z of %uz bytes peeked", n, need);
+
+                rev->ready = 0;
+
+                cscf = ngx_http_get_module_srv_conf(hc->conf_ctx,
+                                                    ngx_http_core_module);
+
+                if (!rev->timer_set) {
+                    ngx_add_timer(rev, cscf->client_header_timeout);
+                }
+
+                if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                    ngx_http_close_connection(c);
+                }
+
+                return;
+            }
+        }
+
         hc->proxy_protocol = 0;
 
         p = ngx_proxy_protocol_read(c, buf, buf + n);
